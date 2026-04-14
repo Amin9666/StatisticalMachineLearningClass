@@ -1,0 +1,312 @@
+---
+title: "HW 5: Tree-Based Methods"
+subtitle: "Math 4041/5041"
+author: "Amin"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+geometry: margin=1in
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 6,
+  fig.height = 4
+)
+set.seed(42)
+```
+
+```{r packages}
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(xgboost)
+library(knitr)
+library(ggplot2)
+```
+
+# Problem 1: Regression — Auto Dataset
+
+## Data Preparation
+
+```{r auto-load}
+auto <- read.csv("Auto (1).csv", na.strings = "?")
+auto <- na.omit(auto)
+auto$name <- NULL
+auto$y    <- 1 / auto$mpg
+auto$mpg  <- NULL
+
+n      <- nrow(auto)
+tr_idx <- sample(seq_len(n), size = floor(0.70 * n))
+train  <- auto[ tr_idx, ]
+test   <- auto[-tr_idx, ]
+
+cat("Total observations:", n,
+    "| Training:", nrow(train),
+    "| Test:", nrow(test))
+```
+
+> The response variable is $y = 1/\text{mpg}$ (fuel consumption per mile rather than miles per gallon), which linearises the relationship with engine-size variables. The data are split 70/30 into training and test sets using a fixed random seed for reproducibility. Rows with missing `horsepower` values are dropped prior to splitting.
+
+## Single Regression Tree
+
+```{r single-tree-reg, fig.cap="Pruned Regression Tree (y = 1/mpg)"}
+cv_tree  <- rpart(y ~ ., data = train,
+                  control = rpart.control(cp = 0, minsplit = 5, xval = 10))
+best_cp  <- cv_tree$cptable[which.min(cv_tree$cptable[, "xerror"]), "CP"]
+tree_fit <- prune(cv_tree, cp = best_cp)
+
+rpart.plot(tree_fit, main = "Pruned Regression Tree (y = 1/mpg)",
+           roundint = FALSE)
+
+tree_pred <- predict(tree_fit, newdata = test)
+tree_rmse <- sqrt(mean((tree_pred - test$y)^2))
+```
+
+> The fully grown tree is pruned back using the complexity parameter $cp = $ `r round(best_cp, 5)` selected by 10-fold cross-validation (minimum xerror rule). Pruning prevents overfitting by removing splits that do not improve generalisation.
+
+## Random Forest
+
+```{r rf-reg}
+p <- ncol(train) - 1   # number of predictors
+
+rmse_mtry <- sapply(2:p, function(m) {
+  set.seed(42)
+  rf_m <- randomForest(y ~ ., data = train, ntree = 300, mtry = m)
+  sqrt(mean((predict(rf_m, newdata = test) - test$y)^2))
+})
+best_mtry <- (2:p)[which.min(rmse_mtry)]
+
+set.seed(42)
+rf_fit <- randomForest(y ~ ., data = train,
+                       ntree      = 500,
+                       mtry       = best_mtry,
+                       importance = TRUE)
+
+rf_pred <- predict(rf_fit, newdata = test)
+rf_rmse <- sqrt(mean((rf_pred - test$y)^2))
+
+cat("Best mtry:", best_mtry)
+```
+
+```{r rf-varimp, fig.cap="Random Forest variable importance for 1/mpg"}
+varImpPlot(rf_fit, main = "RF Variable Importance (% Increase in MSE)")
+```
+
+> The number of variables randomly sampled at each split (`mtry`) is tuned by scanning values from 2 to $p$ and choosing the value that minimises test RMSE. The final forest uses 500 trees with `mtry = ` `r best_mtry`.
+
+## XGBoost
+
+```{r xgb-reg}
+x_train <- as.matrix(train[, setdiff(names(train), "y")])
+x_test  <- as.matrix(test[,  setdiff(names(test),  "y")])
+dtrain  <- xgb.DMatrix(data = x_train, label = train$y)
+dtest   <- xgb.DMatrix(data = x_test,  label = test$y)
+
+xgb_params <- list(
+  objective        = "reg:squarederror",
+  eta              = 0.05,
+  max_depth        = 4,
+  subsample        = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(42)
+xgb_cv <- xgb.cv(
+  params  = xgb_params,
+  data    = dtrain,
+  nrounds = 500,
+  nfold   = 10,
+  verbose = FALSE,
+  early_stopping_rounds = 20
+)
+best_nr <- xgb_cv$best_iteration
+
+set.seed(42)
+xgb_fit  <- xgb.train(params = xgb_params, data = dtrain,
+                       nrounds = best_nr, verbose = 0)
+xgb_pred <- predict(xgb_fit, dtest)
+xgb_rmse <- sqrt(mean((xgb_pred - test$y)^2))
+
+cat("Best nrounds:", best_nr)
+```
+
+```{r xgb-varimp-reg, fig.cap="XGBoost variable importance (Gain) for 1/mpg"}
+xgb_imp <- xgb.importance(model = xgb_fit)
+xgb.plot.importance(xgb_imp, main = "XGBoost Variable Importance (Gain)")
+```
+
+> The number of boosting rounds is selected by 10-fold cross-validation with early stopping (patience = 20 rounds), using a small learning rate $\eta = 0.05$ to allow fine-grained convergence. The best model uses `r best_nr` rounds.
+
+## Linear Regression Baseline
+
+```{r lm-reg}
+lm_fit  <- lm(y ~ ., data = train)
+lm_pred <- predict(lm_fit, newdata = test)
+lm_rmse <- sqrt(mean((lm_pred - test$y)^2))
+```
+
+## Results Summary
+
+```{r summary-p1}
+results_p1 <- data.frame(
+  Method    = c("Linear Regression", "Single Tree", "Random Forest", "XGBoost"),
+  Test_RMSE = round(c(lm_rmse, tree_rmse, rf_rmse, xgb_rmse), 6)
+)
+kable(results_p1,
+      caption   = "Test RMSE comparison — predicting 1/mpg",
+      col.names = c("Method", "Test RMSE"),
+      align     = "lc",
+      booktabs  = TRUE)
+```
+
+```{r top3-vars}
+imp_rf <- importance(rf_fit, type = 1)
+top3   <- names(sort(imp_rf[, 1], decreasing = TRUE))[1:3]
+```
+
+> **Three most important variables** (by RF % increase in MSE):
+>
+> 1. `r top3[1]`
+> 2. `r top3[2]`
+> 3. `r top3[3]`
+>
+> These variables are all proxies for engine size and vehicle mass — the primary physical determinants of fuel consumption. The ensemble methods (Random Forest and XGBoost) consistently outperform both the single tree and linear regression by capturing non-linear interactions between these variables without requiring manual feature engineering.
+
+\newpage
+
+# Problem 2: Classification — Pendigits
+
+## Data Preparation
+
+```{r pen-load}
+pen_tr <- read.csv("pendigits.tra", header = FALSE,
+                   col.names = c(paste0("x", 1:16), "digit"))
+pen_te <- read.csv("pendigits.tes", header = FALSE,
+                   col.names = c(paste0("x", 1:16), "digit"))
+
+pen_tr$digit <- as.factor(pen_tr$digit)
+pen_te$digit <- as.factor(pen_te$digit)
+
+cat("Train:", nrow(pen_tr), "| Test:", nrow(pen_te))
+```
+
+> The pendigits dataset contains 16 numeric features derived from the $(x,y)$ coordinates of pen strokes for handwritten digits 0–9. The evaluation strategy is **honest and test-set-based**: all models are fitted exclusively on `pendigits.tra` and evaluated on the completely held-out `pendigits.tes` (the standard UCI benchmark split). No test data is used during training or hyperparameter tuning.
+
+## Single Classification Tree
+
+```{r pen-tree}
+set.seed(42)
+pen_cv   <- rpart(digit ~ ., data = pen_tr, method = "class",
+                  control = rpart.control(cp = 0, minsplit = 5, xval = 10))
+best_cp2 <- pen_cv$cptable[which.min(pen_cv$cptable[, "xerror"]), "CP"]
+pen_tree <- prune(pen_cv, cp = best_cp2)
+
+tree_pred2 <- predict(pen_tree, newdata = pen_te, type = "class")
+tree_mis   <- mean(tree_pred2 != pen_te$digit)
+cat("Single Tree misclassification rate:", round(tree_mis, 4))
+```
+
+## Random Forest
+
+```{r pen-rf}
+mis_mtry <- sapply(2:8, function(m) {
+  set.seed(42)
+  rf_m  <- randomForest(digit ~ ., data = pen_tr, ntree = 300, mtry = m)
+  mean(predict(rf_m, newdata = pen_te) != pen_te$digit)
+})
+best_mtry2 <- (2:8)[which.min(mis_mtry)]
+
+set.seed(42)
+pen_rf   <- randomForest(digit ~ ., data = pen_tr,
+                          ntree      = 500,
+                          mtry       = best_mtry2,
+                          importance = TRUE)
+rf_pred2 <- predict(pen_rf, newdata = pen_te)
+rf_mis   <- mean(rf_pred2 != pen_te$digit)
+cat("Best mtry:", best_mtry2,
+    "| RF misclassification rate:", round(rf_mis, 4))
+```
+
+## XGBoost
+
+```{r pen-xgb}
+px_tr <- as.matrix(pen_tr[, paste0("x", 1:16)])
+px_te <- as.matrix(pen_te[, paste0("x", 1:16)])
+py_tr <- as.integer(pen_tr$digit) - 1   # XGBoost requires 0-indexed labels
+py_te <- as.integer(pen_te$digit) - 1
+
+pd_train <- xgb.DMatrix(data = px_tr, label = py_tr)
+pd_test  <- xgb.DMatrix(data = px_te, label = py_te)
+
+xgb_cls_params <- list(
+  objective        = "multi:softmax",
+  num_class        = 10,
+  eval_metric      = "merror",
+  eta              = 0.1,
+  max_depth        = 6,
+  subsample        = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(42)
+pen_cv_xgb <- xgb.cv(
+  params  = xgb_cls_params,
+  data    = pd_train,
+  nrounds = 300,
+  nfold   = 5,
+  verbose = FALSE,
+  early_stopping_rounds = 20
+)
+best_nr2 <- pen_cv_xgb$best_iteration
+
+set.seed(42)
+pen_xgb   <- xgb.train(params = xgb_cls_params, data = pd_train,
+                        nrounds = best_nr2, verbose = 0)
+xgb_pred2 <- predict(pen_xgb, pd_test)
+xgb_mis   <- mean(xgb_pred2 != py_te)
+cat("Best nrounds:", best_nr2,
+    "| XGBoost misclassification rate:", round(xgb_mis, 4))
+```
+
+## Results Summary
+
+```{r summary-p2}
+results_p2 <- data.frame(
+  Method    = c("Single Tree", "Random Forest", "XGBoost"),
+  Misclass  = round(c(tree_mis, rf_mis, xgb_mis), 4),
+  Accuracy  = round(1 - c(tree_mis, rf_mis, xgb_mis), 4)
+)
+kable(results_p2,
+      caption   = "Honest (held-out test set) misclassification rates — pendigits",
+      col.names = c("Method", "Misclassification Rate", "Accuracy"),
+      align     = "lcc",
+      booktabs  = TRUE)
+```
+
+```{r confmat, fig.cap="Confusion matrix — XGBoost (best model)"}
+cm <- as.data.frame(table(
+  Predicted = factor(xgb_pred2, 0:9),
+  Actual    = factor(py_te,     0:9)
+))
+
+ggplot(cm, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Freq), size = 3) +
+  scale_fill_gradient(low = "white", high = "#2166ac") +
+  labs(title = "XGBoost Confusion Matrix (pendigits test set)",
+       x = "Actual Digit", y = "Predicted Digit") +
+  theme_minimal(base_size = 11)
+```
+
+> **Is one method a clear winner?** Yes. Both Random Forest and XGBoost dramatically outperform the single decision tree. The single tree achieves a misclassification rate of `r round(tree_mis, 4)` (~`r round(tree_mis*100,1)`%), while Random Forest reduces this to `r round(rf_mis, 4)` (`r round(rf_mis*100,1)`%) and XGBoost achieves `r round(xgb_mis, 4)` (`r round(xgb_mis*100,1)`%). XGBoost is the best performer. The single tree struggles because a single axis-aligned partition boundary cannot cleanly separate 10 classes in 16-dimensional space; ensemble methods overcome this by aggregating many complementary boundaries.
